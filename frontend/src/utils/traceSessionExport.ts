@@ -27,6 +27,16 @@ type ExportOptions = {
 
 const STORAGE_KEY = 'interactiveai.trace-session.v1'
 
+/**
+ * Endpoint of the WP3 Human-AI Interaction Testing service that receives the
+ * session trace on logout (`POST /collect/session-trace`).
+ *
+ * Build-time variable. Empty when this frontend is not running under a WP3
+ * testing session, in which case the POST is skipped entirely and the existing
+ * browser download is the only export path.
+ */
+const WP3_COLLECT_URL = import.meta.env.VITE_WP3_COLLECT_URL ?? ''
+
 function generateSessionId() {
   if (window.isSecureContext && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID()
@@ -34,6 +44,49 @@ function generateSessionId() {
   return '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, (char) =>
     (+char ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (+char / 4)))).toString(16)
   )
+}
+
+/**
+ * Send the exported session trace to the WP3 collect endpoint.
+ *
+ * Called on operator logout alongside the existing browser download, so the WP3
+ * service can write `kpis.json` server-side rather than relying on the operator
+ * to upload the downloaded file.
+ *
+ * The WP3 service resolves which session the trace belongs to from the
+ * `wp3_session_id` field. That value comes from the `session_id` query parameter
+ * on the GUI URL handed to the operator; when it is absent, WP3 falls back to
+ * the single active session, so omitting it stays correct for single-session use.
+ *
+ * Failures are logged and swallowed: a missing or unreachable WP3 service must
+ * never break the operator's logout or the local download.
+ *
+ * @param payload Exported session trace (sessionId, userLogin, kpis, traces, …).
+ */
+function postSessionTraceToWp3(payload: Record<string, unknown>): void {
+  if (!WP3_COLLECT_URL) return
+
+  const wp3SessionId = new URLSearchParams(window.location.search).get('session_id')
+  const body = wp3SessionId ? { ...payload, wp3_session_id: wp3SessionId } : payload
+
+  // Deliberately not awaited — logout() is synchronous. `keepalive` is not used
+  // because session traces routinely exceed the 64 KB keepalive body limit.
+  fetch(WP3_COLLECT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  })
+    .then((response) => {
+      if (!response.ok) {
+        console.error(
+          `Unable to deliver trace session to WP3 (${WP3_COLLECT_URL}): ` +
+            `${response.status} ${response.statusText}`
+        )
+      }
+    })
+    .catch((error) => {
+      console.error(`Unable to deliver trace session to WP3 (${WP3_COLLECT_URL}):`, error)
+    })
 }
 
 function createSession(userLogin?: string): TraceSession {
@@ -607,19 +660,18 @@ export function exportTraceSession(format: ExportFormat = 'json', options: Expor
     }
   }
 
-  const json = JSON.stringify(
-    {
-      sessionId: session.sessionId,
-      userLogin: session.userLogin,
-      startedAt: session.startedAt,
-      endedAt,
-      kpis,
-      traces: structured
-    },
-    null,
-    2
-  )
+  const exportPayload = {
+    sessionId: session.sessionId,
+    userLogin: session.userLogin,
+    startedAt: session.startedAt,
+    endedAt,
+    kpis,
+    traces: structured
+  }
+
+  const json = JSON.stringify(exportPayload, null, 2)
   download(json, 'application/json;charset=utf-8', sessionFileName(session, 'json'))
+  postSessionTraceToWp3(exportPayload)
 
   // Open HTML summary in a new tab (use <a target="_blank"> to avoid popup blocker)
   const summaryBlob = new Blob([summaryHtml], { type: 'text/html;charset=utf-8' })

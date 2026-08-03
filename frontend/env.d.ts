@@ -8,6 +8,7 @@ interface ImportMetaEnv {
   readonly VITE_RAILWAY_SIMU: string
   readonly VITE_ATM_SIMU: string
   readonly VITE_COGNITIVE_TOKEN: string
+  readonly VITE_WP3_COLLECT_URL: string
 }
 
 interface ImportMeta {
