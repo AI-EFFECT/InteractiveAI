@@ -6,7 +6,16 @@ import time
 from datetime import datetime, timedelta
 import numpy as np
 from config.config import logging, set_pause, get_pause_status
+from config.env_overrides import (
+    configuration_is_externally_managed,
+    resolve_cab_url,
+)
 from app.models.recommendation_store import store as recommendation_store
+
+# Key under [Connexion] used for a CAB URL supplied by the environment. It is
+# deliberately ordered before the shipped cab_server_url_* entries so the UI
+# offers the deployment's own platform as the default selection (FR-31).
+ENVIRONMENT_CAB_URL_KEY = "cab_server_url_0_environment"
 
 class Communicate:
     """
@@ -32,9 +41,15 @@ class Communicate:
     def load_config(self):
         """
         Loads the configuration from the 'config/API_POWERGRID_CAB.toml' file.
+
+        When the environment supplies a CAB platform URL (HAI_CAB_URL or
+        CAB_API_URL) it is inserted ahead of the addresses shipped in the file,
+        which are hardcoded to a LAN range that does not resolve on any other
+        deployment's network (FR-31).
         """
         try:
             self.outputs_config = toml.load("config/API_POWERGRID_CAB.toml")
+            self._apply_environment_cab_url()
             if self.outputs_config['Outputs']['activate'] == 'yes':
                 self.cab_api_on = True
             else:
@@ -51,9 +66,36 @@ class Communicate:
         except Exception as e:
             logging.error("An unexpected error occurred: %s", str(e))
 
+    def _apply_environment_cab_url(self):
+        """
+        Insert the environment-supplied CAB URL into the loaded configuration.
+
+        Sets ``self.cab_url`` so downstream code has the platform address
+        without going through the UI's server picker, and registers the URL
+        under [Connexion] so it appears — first — in the picker as well.
+
+        Does nothing when no CAB URL variable is set, leaving the shipped file
+        contents untouched.
+        """
+        environment_cab_url = resolve_cab_url()
+        if environment_cab_url is None:
+            return
+
+        connexion_section = self.outputs_config.setdefault('Connexion', {})
+        connexion_section[ENVIRONMENT_CAB_URL_KEY] = environment_cab_url
+        self.cab_url = environment_cab_url
+
+        logging.info(
+            "CAB platform URL taken from the environment: %s", environment_cab_url)
+
     def edit_parameters(self, parameter_name, new_value):
         """
         Modifies a parameter in the configuration and saves the changes.
+
+        The change is persisted to the TOML file only when configuration is not
+        externally managed. Under WP3 the file lives inside a container image
+        that is reused across sessions, so writing to it would leave one
+        session's parameters behind for the next (FR-32).
 
         Args:
             parameter_name: Name of the parameter to modify.
@@ -73,6 +115,14 @@ class Communicate:
                     "Parameter %s does not exist in the configuration.", parameter_name)
                 return
         current_param[keys[-1]] = new_value
+
+        if configuration_is_externally_managed():
+            # The in-memory value above is authoritative for this session; the
+            # file stays as shipped so the container remains disposable.
+            logging.info(
+                "Configuration is externally managed; keeping %s in memory "
+                "instead of writing API_POWERGRID_CAB.toml", parameter_name)
+            return
 
         # Save changes to configuration file
         with open("config/API_POWERGRID_CAB.toml", "w", encoding="utf-8") as file:
@@ -141,17 +191,28 @@ class Communicate:
         """
         Retrieves the InteractiveAI server URLs from the configuration file.
 
+        A CAB URL supplied by the environment is returned first, so the index
+        page offers the deployment's own platform ahead of the addresses baked
+        into the file (FR-31).
+
         Returns:
-            dict: Dictionary of InteractiveAI server URLs.
+            dict: Dictionary of InteractiveAI server URLs, insertion-ordered
+                with any environment-supplied URL first.
         """
         try:
             config = toml.load("config/API_POWERGRID_CAB.toml")
+
+            urls = {}
+            environment_cab_url = resolve_cab_url()
+            if environment_cab_url is not None:
+                urls[ENVIRONMENT_CAB_URL_KEY] = environment_cab_url
+
             # Access [Connexion] section and retrieve all URLs
-            urls = {
+            urls.update({
                 key: value
                 for key, value in config['Connexion'].items()
                 if key.startswith('cab_server_url_')
-            }
+            })
             return urls
         except KeyError:
             print(

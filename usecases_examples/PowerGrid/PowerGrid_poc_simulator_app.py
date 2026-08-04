@@ -9,12 +9,18 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from app.models.Communicate import Communicate
 from app.models.Simulator import Simulator
 from app.models.recommendation_store import store as recommendation_store
+from app.models.hai_session_state import state as hai_session_state
 from config.config import logging, set_pause
+from config.env_overrides import describe_active_overrides
 
 
 app = Flask(__name__, template_folder='app/templates')
 app.secret_key = 'votre_clé_secrète_ici'
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+# x_prefix honours X-Forwarded-Prefix so url_for() generates correct links when
+# a reverse proxy serves this app under a path such as /s/<session-id>/gui.
+# Without it every generated URL points at the proxy root and the participant's
+# first navigation leaves the session (FR-33).
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_prefix=1)
 socketio = SocketIO(app, cors_allowed_origins='*')
 
 @app.after_request
@@ -173,13 +179,40 @@ def edit_simulation_settings():
 socketio.start_background_task(simu.run_simulator, com)
 
 
+def _tracked_simulation_stream(simulation_stream):
+    """
+    Wrap the simulation stream so session state follows the participant.
+
+    ``run_simulator`` is a generator: its body does not execute until something
+    iterates it, which happens when this stream is consumed by the browser.
+    Wrapping it is therefore the only accurate place to observe that a session
+    has actually started, and the ``finally`` clause is the only place that
+    catches every way it can end — episode complete, exception, or the
+    participant closing the tab (FR-34).
+
+    Args:
+        simulation_stream: The generator returned by ``simu.run_simulator``.
+
+    Yields:
+        Each chunk of the original stream, unmodified.
+    """
+    hai_session_state.mark_running()
+    try:
+        for simulation_chunk in simulation_stream:
+            yield simulation_chunk
+    finally:
+        hai_session_state.mark_finished()
+
+
 @app.route('/start_simulation', methods=['GET'])
 def start_simulation():
     """Start the simulation."""
     if 'username' in session:
         if not hasattr(g, 'thread_started') or not g.thread_started:
-            response = Response(stream_with_context(simu.run_simulator(com)),
-                                mimetype='text/event-stream')
+            response = Response(
+                stream_with_context(
+                    _tracked_simulation_stream(simu.run_simulator(com))),
+                mimetype='text/event-stream')
             response.headers['Cache-Control'] = 'no-cache'
             response.headers['Connection'] = 'keep-alive'
             response.headers['X-Accel-Buffering'] = 'no'
@@ -254,5 +287,162 @@ def send_act():
     return jsonify(act_dict)
 
 
+# ---------------------------------------------------------------------------
+# WP3 Human-AI session control API (FR-34)
+#
+# These three endpoints let an external control plane bind this simulator to a
+# session, release it again, and poll what it is doing — without restarting the
+# container. They exist so a fixed pool of simulator containers can be
+# reassigned between participants, which removes the need for anything to
+# create containers at runtime and therefore removes the Docker socket from the
+# deployment entirely.
+#
+# They are deliberately thin: configuration and initialisation go through the
+# same simu.load_and_edit_config() and simu.initialize_simulation() calls that
+# the existing /edit_config form route has always used. Nothing here changes
+# behaviour for an operator driving the app through its own UI.
+# ---------------------------------------------------------------------------
+
+# Fields a caller may set on POST /hai/session, mapped to CONFIG.toml keys.
+# Restricting the accepted set keeps an external caller from writing arbitrary
+# keys into the simulator's configuration dictionary.
+HAI_SESSION_CONFIG_FIELDS = {
+    "scenario_name": str,
+    "env_name": str,
+    "env_seed": int,
+    "assistant_path": str,
+    "assistant_seed": int,
+    "scenario_first_step": int,
+    "step_start_security_analysis": int,
+    "refresh_frequency_step": int,
+    "time_step_forecast": int,
+    "duration_step_forecast": int,
+    "stepDuration_s": float,
+}
+
+
+def _parse_hai_session_config(request_body):
+    """
+    Extract and type-convert the configuration fields of a session request.
+
+    Args:
+        request_body: Parsed JSON body of POST /hai/session.
+
+    Returns:
+        Tuple of (config_parameters, error_message). ``error_message`` is None
+        when parsing succeeded; when it is set, ``config_parameters`` is empty
+        and the caller should reject the request.
+    """
+    config_parameters = {}
+
+    for field_name, field_type in HAI_SESSION_CONFIG_FIELDS.items():
+        if field_name not in request_body:
+            continue
+
+        raw_value = request_body[field_name]
+        try:
+            config_parameters[field_name] = field_type(raw_value)
+        except (TypeError, ValueError):
+            return {}, "Field '{}' must be of type {}, got {!r}".format(
+                field_name, field_type.__name__, raw_value)
+
+    return config_parameters, None
+
+
+@app.route('/hai/session', methods=['POST'])
+def hai_configure_session():
+    """Bind this simulator to a WP3 session and load its scenario.
+
+    Configures the simulation from the request body and initialises the
+    grid2op environment, so the participant who opens the GUI afterwards lands
+    on a scenario prepared for them. Replaces what previously required starting
+    a container with per-session environment variables.
+
+    Returns 409 when a session is already bound, so a control plane can never
+    silently overwrite a running participant's session — the slot must be reset
+    first.
+    """
+    request_body = request.get_json(silent=True)
+    if not isinstance(request_body, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+
+    session_id = request_body.get("session_id")
+    if not session_id:
+        return jsonify({"error": "Field 'session_id' is required"}), 400
+
+    if hai_session_state.is_occupied():
+        current_state = hai_session_state.snapshot()
+        return jsonify({
+            "error": "This simulator is already bound to a session",
+            "current": current_state,
+        }), 409
+
+    config_parameters, parse_error = _parse_hai_session_config(request_body)
+    if parse_error is not None:
+        return jsonify({"error": parse_error}), 400
+
+    cab_url = request_body.get("cab_url")
+    if cab_url:
+        com.cab_url = cab_url
+
+    try:
+        simu.load_and_edit_config(config_parameters or None)
+        simu.initialize_simulation(com, session)
+    except Exception as initialisation_error:  # noqa: BLE001
+        # Leave the simulator idle rather than half-configured, so the control
+        # plane can retry on this same container or pick another one.
+        logging.exception("Failed to initialise session %s", session_id)
+        simu.release_environment()
+        hai_session_state.reset()
+        return jsonify({
+            "error": "Failed to initialise the simulation",
+            "detail": str(initialisation_error),
+        }), 500
+
+    loaded_scenario_name = None
+    if simu.env is not None:
+        loaded_scenario_name = simu.env.chronics_handler.get_name()
+
+    hai_session_state.mark_configured(session_id, loaded_scenario_name)
+    logging.info(
+        "Session %s configured: scenario=%s", session_id, loaded_scenario_name)
+
+    return jsonify(hai_session_state.snapshot()), 200
+
+
+@app.route('/hai/reset', methods=['POST'])
+def hai_reset_session():
+    """Release the bound session and return this simulator to the free pool.
+
+    Closes the grid2op environment so the LightSim backend it holds is freed
+    rather than leaked, then clears the session binding. Idempotent: resetting
+    an already-idle simulator succeeds and reports the idle state.
+    """
+    previous_state = hai_session_state.snapshot()
+
+    simu.release_environment()
+    hai_session_state.reset()
+
+    logging.info(
+        "Session %s released; simulator returned to the pool",
+        previous_state.get("session_id"))
+
+    return jsonify({
+        "released": previous_state,
+        "current": hai_session_state.snapshot(),
+    }), 200
+
+
+@app.route('/hai/state', methods=['GET'])
+def hai_read_state():
+    """Report which session this simulator is serving and how far it has got.
+
+    Polled by the WP3 control plane to detect a finished episode and to verify
+    that a slot really is free before assigning it.
+    """
+    return jsonify(hai_session_state.snapshot()), 200
+
+
 if __name__ == '__main__':
+    logging.info(describe_active_overrides())
     socketio.run(app, debug=True, allow_unsafe_werkzeug=True, host='0.0.0.0', port=5000)

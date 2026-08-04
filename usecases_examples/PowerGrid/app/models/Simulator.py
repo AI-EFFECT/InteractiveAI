@@ -12,6 +12,10 @@ import matplotlib
 matplotlib.use('agg')
 from app.models.Listener import Listener
 from config.config import logging, set_pause, get_pause_status
+from config.env_overrides import (
+    collect_config_overrides,
+    configuration_is_externally_managed,
+)
 from app.models.utils import (create_observation_image, get_alert_lines, search_chronic_num_from_name,
                    get_curent_lines_in_bad_kpi, get_curent_lines_lost,
                    get_zone_where_alarm_occured, expand_act_from_cab,
@@ -45,16 +49,73 @@ class Simulator:
         """
         Load and optionally edit the configuration from a TOML file.
 
+        Resolution order is explicit parameters, then environment variables,
+        then the values shipped in CONFIG.toml. The file remains the default
+        source, so starting the image with no environment set reproduces the
+        original behaviour exactly (FR-30).
+
+        The updated configuration is persisted back to the file only when
+        configuration is not externally managed. Under WP3 this container is
+        reused across sessions, and writing to the image filesystem would carry
+        one session's parameters into the next (FR-32).
+
         Args:
             params (dict, optional): New parameters to update the configuration.
+                Take precedence over both the environment and the file.
         """
         config_path = "config/CONFIG.toml"
         self.config = toml.load(config_path)
-        if params:
-            # Update the configuration file with new parameters
-            self.config.update(params)
-            with open(config_path, 'w', encoding='utf-8') as config_file:
-                toml.dump(self.config, config_file)
+
+        environment_overrides = collect_config_overrides()
+        if environment_overrides:
+            self.config.update(environment_overrides)
+
+        if not params:
+            return
+
+        self.config.update(params)
+
+        if configuration_is_externally_managed():
+            logging.info(
+                "Configuration is externally managed; applying %d parameter(s) "
+                "in memory without rewriting CONFIG.toml", len(params))
+            return
+
+        # Update the configuration file with new parameters
+        with open(config_path, 'w', encoding='utf-8') as config_file:
+            toml.dump(self.config, config_file)
+
+    def release_environment(self):
+        """
+        Close the current grid2op environment, if one is loaded.
+
+        ``grid2op.make`` allocates a LightSim backend that holds file handles
+        and native memory. Before this method existed, re-initialising simply
+        rebound ``self.env`` and dropped the previous environment without
+        closing it, which leaked a backend per initialisation. That was
+        harmless when a container served exactly one session and was then
+        discarded, but it is not harmless in a pooled container that is
+        reassigned across sessions (FR-11).
+
+        Safe to call when no environment is loaded, and never raises: a failure
+        to close must not prevent the next session from starting.
+        """
+        if self.env is None:
+            return
+
+        try:
+            self.env.close()
+            logging.info("Released the previous grid2op environment.")
+        except Exception as close_error:  # noqa: BLE001 - see docstring
+            logging.warning(
+                "Could not close the previous grid2op environment: %s", close_error)
+        finally:
+            self.env = None
+            self.obs = None
+            self.act = None
+            self.listen = None
+            self.local_assistant = None
+            self.agent_reco = None
 
     def initialize_simulation(self, com, session):
         """
@@ -69,6 +130,8 @@ class Simulator:
         """
         if 'message' not in session or not isinstance(session['message'], list):
             session['message'] = []
+
+        self.release_environment()
 
         forecasts_horizons = [5, 10, 15, 20, 25, 30]
         self.env = grid2op.make(self.config['env_name'],
